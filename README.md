@@ -2,6 +2,10 @@
 
 A Terminal User Interface (TUI) application for managing Git worktrees written in Go.
 
+<img width="561" alt="image" src="https://github.com/user-attachments/assets/5a109d42-a64a-4924-bed5-09cd4841cc6a" />
+
+
+
 ## Features
 
 - **List existing worktrees** - View all current worktrees with their paths and branches
