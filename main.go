@@ -15,7 +15,7 @@ import (
 	"github.com/sahilm/fuzzy"
 )
 
-const version = "v0.2.0"
+const version = "v0.2.1"
 
 type model struct {
 	worktrees            []Worktree
@@ -400,7 +400,9 @@ func (m model) View() string {
 			content.WriteString(errorStyle.Render("No worktrees found."))
 			content.WriteString("\n")
 		} else {
-			start, end := m.getViewportRange(len(m.worktrees))
+			// Calculate how many worktrees can fit (each takes 2 lines)
+			maxWorktreesInView := m.viewportHeight / 2
+			start, end := m.getViewportRangeForWorktrees(len(m.worktrees), maxWorktreesInView)
 			for i := start; i < end; i++ {
 				if i >= len(m.worktrees) {
 					break
@@ -411,7 +413,7 @@ func (m model) View() string {
 				content.WriteString("\n")
 			}
 			// Add scroll indicator
-			if len(m.worktrees) > m.viewportHeight {
+			if len(m.worktrees) > maxWorktreesInView {
 				content.WriteString(m.renderScrollIndicator(end-start, len(m.worktrees)))
 				content.WriteString("\n")
 			}
@@ -507,24 +509,28 @@ func (m model) renderHeader() string {
 }
 
 func (m model) renderWorktreeItem(worktree Worktree, selected bool) string {
-	// Shorten path for display
-	displayPath := worktree.Path
-	if len(displayPath) > 50 {
-		displayPath = "..." + displayPath[len(displayPath)-47:]
-	}
+	// Create main content line with basename and branch
+	mainContent := fmt.Sprintf("%s (%s)", filepath.Base(worktree.Path), worktree.Branch)
 	
-	content := fmt.Sprintf("%s (%s)", filepath.Base(displayPath), worktree.Branch)
+	// Create path line with proper styling
+	pathStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
+	pathContent := pathStyle.Render("  " + worktree.Path)
 	
 	// Check if this worktree is being deleted
 	if m.deletingWorktree && worktree.Path == m.deletingPath {
 		deletingStyle := errorStyle.Copy().Strikethrough(true)
-		return deletingStyle.Render("🗑️  Deleting " + content + "...")
+		return deletingStyle.Render("🗑️  Deleting " + mainContent + "...")
 	}
 	
+	// Combine main content and path
+	var fullContent string
 	if selected {
-		return selectedItemStyle.Render("▶ " + content)
+		fullContent = selectedItemStyle.Render("▶ " + mainContent) + "\n" + pathContent
+	} else {
+		fullContent = normalItemStyle.Render("  " + mainContent) + "\n" + pathContent
 	}
-	return normalItemStyle.Render("  " + content)
+	
+	return fullContent
 }
 
 func (m model) renderBranchItem(branch Branch, selected bool) string {
@@ -587,10 +593,21 @@ func (m *model) filterBranches() {
 }
 
 func (m *model) adjustScrollOffset() {
-	if m.cursor < m.scrollOffset {
-		m.scrollOffset = m.cursor
-	} else if m.cursor >= m.scrollOffset+m.viewportHeight {
-		m.scrollOffset = m.cursor - m.viewportHeight + 1
+	if m.view == "worktrees" {
+		// For worktrees view, each item takes 2 lines
+		maxWorktreesInView := m.viewportHeight / 2
+		if m.cursor < m.scrollOffset {
+			m.scrollOffset = m.cursor
+		} else if m.cursor >= m.scrollOffset+maxWorktreesInView {
+			m.scrollOffset = m.cursor - maxWorktreesInView + 1
+		}
+	} else {
+		// For branches view, each item takes 1 line
+		if m.cursor < m.scrollOffset {
+			m.scrollOffset = m.cursor
+		} else if m.cursor >= m.scrollOffset+m.viewportHeight {
+			m.scrollOffset = m.cursor - m.viewportHeight + 1
+		}
 	}
 }
 
@@ -605,6 +622,25 @@ func (m *model) getViewportRange(totalItems int) (int, int) {
 	if end > totalItems {
 		end = totalItems
 		start = end - m.viewportHeight
+		if start < 0 {
+			start = 0
+		}
+	}
+	
+	return start, end
+}
+
+func (m *model) getViewportRangeForWorktrees(totalItems int, maxItemsInView int) (int, int) {
+	if totalItems <= maxItemsInView {
+		return 0, totalItems
+	}
+	
+	start := m.scrollOffset
+	end := start + maxItemsInView
+	
+	if end > totalItems {
+		end = totalItems
+		start = end - maxItemsInView
 		if start < 0 {
 			start = 0
 		}
