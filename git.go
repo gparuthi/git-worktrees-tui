@@ -2,10 +2,12 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -75,6 +77,36 @@ func openWorktreeCmd(worktree Worktree) tea.Cmd {
 			return err
 		}
 		return nil
+	}
+}
+
+func openTerminalCmd(worktree Worktree) tea.Cmd {
+	return func() tea.Msg {
+		err := openTerminal(worktree)
+		if err != nil {
+			return err
+		}
+		return tea.Quit()
+	}
+}
+
+func openTerminalWithClaudeCmd(worktree Worktree) tea.Cmd {
+	return func() tea.Msg {
+		err := openTerminalWithClaude(worktree)
+		if err != nil {
+			return err
+		}
+		return tea.Quit()
+	}
+}
+
+func openTerminalWithClaudeRCmd(worktree Worktree) tea.Cmd {
+	return func() tea.Msg {
+		err := openTerminalWithClaudeR(worktree)
+		if err != nil {
+			return err
+		}
+		return tea.Quit()
 	}
 }
 
@@ -214,7 +246,7 @@ func createWorktree(branch Branch) error {
 		return err
 	}
 	
-	repoRoot, err := getRepoRoot()
+	repoRoot, err := getMainRepoRoot()
 	if err != nil {
 		return err
 	}
@@ -236,11 +268,27 @@ func createWorktree(branch Branch) error {
 
 func deleteWorktree(worktree Worktree) error {
 	cmd := exec.Command("git", "worktree", "remove", worktree.Path)
-	return cmd.Run()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		// Try again with --force if the initial remove failed
+		cmdForce := exec.Command("git", "worktree", "remove", "--force", worktree.Path)
+		forceOutput, forceErr := cmdForce.CombinedOutput()
+		if forceErr != nil {
+			msg := strings.TrimSpace(string(forceOutput))
+			if msg == "" {
+				msg = strings.TrimSpace(string(output))
+			}
+			if msg != "" {
+				return fmt.Errorf("%s", msg)
+			}
+			return forceErr
+		}
+	}
+	return nil
 }
 
 func getRepoName() (string, error) {
-	repoRoot, err := getRepoRoot()
+	repoRoot, err := getMainRepoRoot()
 	if err != nil {
 		return "", err
 	}
@@ -257,13 +305,36 @@ func getRepoRoot() (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
+func getMainRepoRoot() (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--git-common-dir")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+
+	commonDir := strings.TrimSpace(string(output))
+	if commonDir == "" {
+		return "", fmt.Errorf("could not determine git common dir")
+	}
+
+	if !filepath.IsAbs(commonDir) {
+		repoRoot, err := getRepoRoot()
+		if err != nil {
+			return "", err
+		}
+		commonDir = filepath.Join(repoRoot, commonDir)
+	}
+
+	return filepath.Dir(commonDir), nil
+}
+
 func createNewBranchWorktree(branchName string) error {
 	repoName, err := getRepoName()
 	if err != nil {
 		return err
 	}
 	
-	repoRoot, err := getRepoRoot()
+	repoRoot, err := getMainRepoRoot()
 	if err != nil {
 		return err
 	}
@@ -314,6 +385,55 @@ func getOriginMainBranch() (string, error) {
 func openWorktree(worktree Worktree) error {
 	cmd := exec.Command("cursor", worktree.Path)
 	return cmd.Run()
+}
+
+func openTerminal(worktree Worktree) error {
+	// Change to the worktree directory
+	if err := os.Chdir(worktree.Path); err != nil {
+		return fmt.Errorf("failed to change directory: %w", err)
+	}
+
+	// Find zsh binary
+	zshPath, err := exec.LookPath("zsh")
+	if err != nil {
+		return fmt.Errorf("zsh not found: %w", err)
+	}
+
+	// Replace current process with zsh
+	// This will close wtree and start zsh in the worktree directory
+	return syscall.Exec(zshPath, []string{"zsh"}, os.Environ())
+}
+
+func openTerminalWithClaude(worktree Worktree) error {
+	// Change to the worktree directory
+	if err := os.Chdir(worktree.Path); err != nil {
+		return fmt.Errorf("failed to change directory: %w", err)
+	}
+
+	// Find claude binary
+	claudePath, err := exec.LookPath("claude")
+	if err != nil {
+		return fmt.Errorf("claude not found: %w", err)
+	}
+
+	// Replace current process with claude
+	return syscall.Exec(claudePath, []string{"claude"}, os.Environ())
+}
+
+func openTerminalWithClaudeR(worktree Worktree) error {
+	// Change to the worktree directory
+	if err := os.Chdir(worktree.Path); err != nil {
+		return fmt.Errorf("failed to change directory: %w", err)
+	}
+
+	// Find claude binary
+	claudePath, err := exec.LookPath("claude")
+	if err != nil {
+		return fmt.Errorf("claude not found: %w", err)
+	}
+
+	// Replace current process with claude -r
+	return syscall.Exec(claudePath, []string{"claude", "-r"}, os.Environ())
 }
 
 func isGitRepository() bool {

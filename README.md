@@ -2,10 +2,6 @@
 
 A Terminal User Interface (TUI) application for managing Git worktrees written in Go.
 
-<img width="561" alt="image" src="https://github.com/user-attachments/assets/5a109d42-a64a-4924-bed5-09cd4841cc6a" />
-
-
-
 ## Features
 
 - **List existing worktrees** - View all current worktrees with their paths and branches
@@ -17,24 +13,28 @@ A Terminal User Interface (TUI) application for managing Git worktrees written i
 ## Installation
 
 ```bash
-go build -o worktree-tui
+go install
 ```
 
 ## Usage
 
 ```bash
-./worktree-tui
+wtree
 ```
 
 ### Key Bindings
 
 - **Tab** - Switch between worktrees and branches view
 - **↑/↓ or k/j** - Navigate up/down
-- **Enter** - 
+- **Enter** -
   - In worktrees view: Open worktree in Cursor IDE
   - In branches view: Create new worktree for selected branch
+- **t** - Open zsh terminal session in selected worktree (in worktrees view)
+- **a** - Open worktree and start `claude` (in worktrees view)
+- **c** - Open worktree and start `claude -r` (in worktrees view)
 - **d** - Delete selected worktree (in worktrees view)
 - **/** - Start fuzzy filtering branches (in branches view)
+- **r** - Refresh worktrees/branches
 - **n** - Create new branch and worktree (in branches view)
 - **Esc** - Clear filter/cancel new branch creation
 - **Backspace** - Remove last character from filter/branch name
