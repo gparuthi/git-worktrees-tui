@@ -15,7 +15,7 @@ import (
 	"github.com/sahilm/fuzzy"
 )
 
-const version = "v0.2.1"
+const version = "v0.4.0"
 
 type model struct {
 	worktrees            []Worktree
@@ -262,6 +262,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.scrollOffset = 0
 			}
 			
+		case keyStr == "r":
+			if !m.filtering && !m.creatingBranch {
+				m.statusMessage = "Refreshing..."
+				return m, tea.Batch(
+					getWorktreesCmd(),
+					getBranchesCmd(),
+					clearStatusAfterDelay(),
+				)
+			}
+			
 		case (keyStr == "/" || keyStr == "f") && m.view == "branches" && !m.filtering && !m.creatingBranch:
 			m.filtering = true
 			m.filterInput.SetValue("")
@@ -278,7 +288,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			
 		case keyStr == "d" && !m.filtering && !m.creatingBranch && !m.deletingWorktree && m.view == "worktrees" && len(m.worktrees) > 0:
 			return m, deleteWorktreeCmd(m.worktrees[m.cursor])
-			
+
+		case keyStr == "t" && !m.filtering && !m.creatingBranch && m.view == "worktrees" && len(m.worktrees) > 0:
+			return m, openTerminalCmd(m.worktrees[m.cursor])
+
+		case keyStr == "a" && !m.filtering && !m.creatingBranch && m.view == "worktrees" && len(m.worktrees) > 0:
+			return m, openTerminalWithClaudeCmd(m.worktrees[m.cursor])
+
+		case keyStr == "c" && !m.filtering && !m.creatingBranch && m.view == "worktrees" && len(m.worktrees) > 0:
+			return m, openTerminalWithClaudeRCmd(m.worktrees[m.cursor])
+
 		}
 
 	case worktreesMsg:
@@ -350,6 +369,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.creatingWorktree = false
 				m.creatingForBranch = ""
 			}
+			if m.deletingWorktree {
+				m.deletingWorktree = false
+				m.deletingPath = ""
+			}
 			m.statusMessage = fmt.Sprintf("❌ Error: %v", err)
 			return m, clearStatusAfterDelay()
 		}
@@ -362,6 +385,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
+	if m.creatingWorktree || m.creatingNewBranch {
+		message := m.statusMessage
+		if message == "" {
+			if m.creatingNewBranch {
+				message = "⏳ Creating new branch and worktree..."
+			} else {
+				message = "⏳ Creating worktree..."
+			}
+		}
+		creatingStyle := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#F59E0B")).
+			Bold(true).
+			PaddingLeft(2)
+		var content strings.Builder
+		content.WriteString(creatingStyle.Render(message))
+		content.WriteString("\n")
+		return content.String()
+	}
+
 	var content strings.Builder
 	
 	// Header with tabs
@@ -400,9 +442,7 @@ func (m model) View() string {
 			content.WriteString(errorStyle.Render("No worktrees found."))
 			content.WriteString("\n")
 		} else {
-			// Calculate how many worktrees can fit (each takes 2 lines)
-			maxWorktreesInView := m.viewportHeight / 2
-			start, end := m.getViewportRangeForWorktrees(len(m.worktrees), maxWorktreesInView)
+			start, end := m.getViewportRange(len(m.worktrees))
 			for i := start; i < end; i++ {
 				if i >= len(m.worktrees) {
 					break
@@ -413,13 +453,13 @@ func (m model) View() string {
 				content.WriteString("\n")
 			}
 			// Add scroll indicator
-			if len(m.worktrees) > maxWorktreesInView {
+			if len(m.worktrees) > m.viewportHeight {
 				content.WriteString(m.renderScrollIndicator(end-start, len(m.worktrees)))
 				content.WriteString("\n")
 			}
 		}
 		
-		content.WriteString(helpStyle.Render("Press 'enter' to open, 'd' to delete, 'tab' to switch to branches"))
+		content.WriteString(helpStyle.Render("Press 'enter' to open in Cursor, 't' terminal, 'a' claude, 'c' claude -r, 'd' delete, 'r' refresh, 'tab' switch"))
 	} else {
 		if m.creatingBranch {
 			content.WriteString(inputStyle.Render("New branch name: "))
@@ -465,7 +505,7 @@ func (m model) View() string {
 		} else if m.filtering {
 			content.WriteString(helpStyle.Render("Type to fuzzy filter, 'enter' to select, 'esc' to cancel (all text editing keys work)"))
 		} else {
-			content.WriteString(helpStyle.Render("Press 'enter' to create worktree, 'n' for new branch, 'f' or '/' to filter, 'tab' to switch to worktrees"))
+			content.WriteString(helpStyle.Render("Press 'enter' to create worktree, 'n' for new branch, 'f' or '/' to filter, 'r' to refresh, 'tab' to switch to worktrees"))
 		}
 	}
 
@@ -509,28 +549,24 @@ func (m model) renderHeader() string {
 }
 
 func (m model) renderWorktreeItem(worktree Worktree, selected bool) string {
-	// Create main content line with basename and branch
-	mainContent := fmt.Sprintf("%s (%s)", filepath.Base(worktree.Path), worktree.Branch)
+	// Shorten path for display
+	displayPath := worktree.Path
+	if len(displayPath) > 50 {
+		displayPath = "..." + displayPath[len(displayPath)-47:]
+	}
 	
-	// Create path line with proper styling
-	pathStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))
-	pathContent := pathStyle.Render("  " + worktree.Path)
+	content := fmt.Sprintf("%s (%s)", filepath.Base(displayPath), worktree.Branch)
 	
 	// Check if this worktree is being deleted
 	if m.deletingWorktree && worktree.Path == m.deletingPath {
 		deletingStyle := errorStyle.Copy().Strikethrough(true)
-		return deletingStyle.Render("🗑️  Deleting " + mainContent + "...")
+		return deletingStyle.Render("🗑️  Deleting " + content + "...")
 	}
 	
-	// Combine main content and path
-	var fullContent string
 	if selected {
-		fullContent = selectedItemStyle.Render("▶ " + mainContent) + "\n" + pathContent
-	} else {
-		fullContent = normalItemStyle.Render("  " + mainContent) + "\n" + pathContent
+		return selectedItemStyle.Render("▶ " + content)
 	}
-	
-	return fullContent
+	return normalItemStyle.Render("  " + content)
 }
 
 func (m model) renderBranchItem(branch Branch, selected bool) string {
@@ -593,21 +629,10 @@ func (m *model) filterBranches() {
 }
 
 func (m *model) adjustScrollOffset() {
-	if m.view == "worktrees" {
-		// For worktrees view, each item takes 2 lines
-		maxWorktreesInView := m.viewportHeight / 2
-		if m.cursor < m.scrollOffset {
-			m.scrollOffset = m.cursor
-		} else if m.cursor >= m.scrollOffset+maxWorktreesInView {
-			m.scrollOffset = m.cursor - maxWorktreesInView + 1
-		}
-	} else {
-		// For branches view, each item takes 1 line
-		if m.cursor < m.scrollOffset {
-			m.scrollOffset = m.cursor
-		} else if m.cursor >= m.scrollOffset+m.viewportHeight {
-			m.scrollOffset = m.cursor - m.viewportHeight + 1
-		}
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	} else if m.cursor >= m.scrollOffset+m.viewportHeight {
+		m.scrollOffset = m.cursor - m.viewportHeight + 1
 	}
 }
 
@@ -622,25 +647,6 @@ func (m *model) getViewportRange(totalItems int) (int, int) {
 	if end > totalItems {
 		end = totalItems
 		start = end - m.viewportHeight
-		if start < 0 {
-			start = 0
-		}
-	}
-	
-	return start, end
-}
-
-func (m *model) getViewportRangeForWorktrees(totalItems int, maxItemsInView int) (int, int) {
-	if totalItems <= maxItemsInView {
-		return 0, totalItems
-	}
-	
-	start := m.scrollOffset
-	end := start + maxItemsInView
-	
-	if end > totalItems {
-		end = totalItems
-		start = end - maxItemsInView
 		if start < 0 {
 			start = 0
 		}
