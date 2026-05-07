@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -15,7 +16,7 @@ import (
 	"github.com/sahilm/fuzzy"
 )
 
-const version = "v0.4.0"
+const version = "v0.6.0"
 
 type model struct {
 	worktrees            []Worktree
@@ -39,6 +40,10 @@ type model struct {
 	creatingNewBranch    bool
 	creatingNewBranchName string
 	statusMessage        string
+	exitAction           string // shell command to write to cmd-file on exit
+	creatingPR           bool
+	prInputActive        bool
+	prInput              textinput.Model
 }
 
 type Worktree struct {
@@ -113,7 +118,12 @@ func initialModel() model {
 	newBranchInput.Placeholder = "Enter branch name..."
 	newBranchInput.CharLimit = 100
 	newBranchInput.Width = 40
-	
+
+	prInput := textinput.New()
+	prInput.Placeholder = "PR number, #123, or github.com/.../pull/123"
+	prInput.CharLimit = 200
+	prInput.Width = 60
+
 	return model{
 		selected:              make(map[int]struct{}),
 		view:                  "worktrees",
@@ -132,6 +142,7 @@ func initialModel() model {
 		statusMessage:         "",
 		filterInput:           filterInput,
 		newBranchInput:        newBranchInput,
+		prInput:               prInput,
 	}
 }
 
@@ -169,13 +180,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, cmd)
 		}
 	}
+
+	if m.prInputActive {
+		m.prInput, cmd = m.prInput.Update(msg)
+		if cmd != nil {
+			cmds = append(cmds, cmd)
+		}
+	}
 	
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		keyStr := msg.String()
 		
-		// If we're filtering or creating a branch, let the text input handle most keys
-		if m.filtering || m.creatingBranch {
+		// If we're filtering, creating a branch, or entering a PR ref, let the text input handle most keys
+		if m.filtering || m.creatingBranch || m.prInputActive {
 			switch keyStr {
 			case "ctrl+c":
 				return m, tea.Quit
@@ -191,9 +209,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.newBranchInput.SetValue("")
 					m.newBranchInput.Blur()
 					m.view = "branches"
+				} else if m.prInputActive {
+					m.prInputActive = false
+					m.prInput.SetValue("")
+					m.prInput.Blur()
 				}
 			case "enter":
-				if m.creatingBranch && m.newBranchInput.Value() != "" {
+				if m.prInputActive && strings.TrimSpace(m.prInput.Value()) != "" {
+					ref := strings.TrimSpace(m.prInput.Value())
+					m.prInputActive = false
+					m.prInput.Blur()
+					m.creatingPR = true
+					m.statusMessage = fmt.Sprintf("Creating worktree for PR %s...", ref)
+					return m, startPRCreateCmd(ref)
+				} else if m.creatingBranch && m.newBranchInput.Value() != "" {
 					return m, createNewBranchWorktreeCmd(m.newBranchInput.Value())
 				} else if m.filtering && len(m.branches) > 0 {
 					// Exit filtering mode and create worktree
@@ -227,7 +256,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			
 		case keyStr == "enter":
 			if m.view == "worktrees" && len(m.worktrees) > 0 {
-				return m, openWorktreeCmd(m.worktrees[m.cursor])
+				m.exitAction = fmt.Sprintf("cd %q", m.worktrees[m.cursor].Path)
+				return m, tea.Quit
 			} else if m.view == "branches" && len(m.branches) > 0 {
 				// Set creating status
 				m.creatingWorktree = true
@@ -279,24 +309,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = m.filterInput.Focus()
 			cmds = append(cmds, cmd)
 			
-		case keyStr == "n" && m.view == "branches" && !m.filtering && !m.creatingBranch:
+		case keyStr == "n" && !m.filtering && !m.creatingBranch && !m.prInputActive:
+			// 'n' works from any view; the input is rendered in the branches view, so switch.
+			m.view = "branches"
 			m.creatingBranch = true
 			m.newBranchInput.SetValue("")
 			m.newBranchInput.Focus()
 			cmd = m.newBranchInput.Focus()
 			cmds = append(cmds, cmd)
+
+		case keyStr == "p" && !m.filtering && !m.creatingBranch && !m.prInputActive:
+			m.prInputActive = true
+			m.prInput.SetValue("")
+			m.prInput.Focus()
+			cmd = m.prInput.Focus()
+			cmds = append(cmds, cmd)
 			
 		case keyStr == "d" && !m.filtering && !m.creatingBranch && !m.deletingWorktree && m.view == "worktrees" && len(m.worktrees) > 0:
 			return m, deleteWorktreeCmd(m.worktrees[m.cursor])
 
-		case keyStr == "t" && !m.filtering && !m.creatingBranch && m.view == "worktrees" && len(m.worktrees) > 0:
-			return m, openTerminalCmd(m.worktrees[m.cursor])
-
 		case keyStr == "a" && !m.filtering && !m.creatingBranch && m.view == "worktrees" && len(m.worktrees) > 0:
-			return m, openTerminalWithClaudeCmd(m.worktrees[m.cursor])
+			m.exitAction = fmt.Sprintf("cd %q && claude", m.worktrees[m.cursor].Path)
+			return m, tea.Quit
 
 		case keyStr == "c" && !m.filtering && !m.creatingBranch && m.view == "worktrees" && len(m.worktrees) > 0:
-			return m, openTerminalWithClaudeRCmd(m.worktrees[m.cursor])
+			m.exitAction = fmt.Sprintf("cd %q && claude -r", m.worktrees[m.cursor].Path)
+			return m, tea.Quit
+
+		case keyStr == "ctrl+o":
+			logPath := filepath.Join(os.Getenv("HOME"), ".wtree", "wtree.log")
+			return m, tea.ExecProcess(exec.Command("open", logPath), nil)
 
 		}
 
@@ -313,19 +355,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statusMessage = fmt.Sprintf("Creating new branch '%s' and worktree...", msg.branchName)
 		return m, performCreateNewBranchWorktreeCmd(msg.branchName)
 	case newBranchCreatedMsg:
+		// New branch + worktree created — drop straight into a shell at the new worktree
+		branchName := m.creatingNewBranchName
 		m.creatingBranch = false
 		m.creatingNewBranch = false
 		m.creatingNewBranchName = ""
 		m.newBranchInput.SetValue("")
 		m.newBranchInput.Blur()
-		m.view = "worktrees"
-		m.cursor = 0
-		m.scrollOffset = 0
-		m.statusMessage = "✅ New branch and worktree created successfully"
-		return m, tea.Batch(
-			getWorktreesCmd(),
-			clearStatusAfterDelay(),
-		)
+		path := worktreePathFor(branchName)
+		if path != "" {
+			m.exitAction = fmt.Sprintf("cd %q", path)
+		}
+		return m, tea.Quit
 	case deletingWorktreeMsg:
 		m.deletingWorktree = true
 		m.deletingPath = msg.path
@@ -341,23 +382,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.deletingPath = ""
 		return m, getWorktreesCmd()
 	case worktreeCreatedMsg:
-		// Switch to worktrees view and refresh the list
-		m.view = "worktrees"
-		m.cursor = 0
-		m.scrollOffset = 0
+		// Created from branches view — drop straight into a shell at the new worktree
 		m.creatingWorktree = false
 		m.creatingForBranch = ""
-		m.statusMessage = fmt.Sprintf("✅ Successfully created worktree for branch '%s'", msg.branch)
-		return m, tea.Batch(
-			getWorktreesCmd(),
-			clearStatusAfterDelay(),
-		)
+		path := worktreePathFor(msg.branch)
+		if path != "" {
+			m.exitAction = fmt.Sprintf("cd %q", path)
+		}
+		return m, tea.Quit
+	case prCreatingMsg:
+		m.creatingPR = true
+		m.statusMessage = fmt.Sprintf("Fetching PR %s...", msg.ref)
+		return m, createPRWorktreeCmd(msg.ref)
+	case prCreatedMsg:
+		m.creatingPR = false
+		m.prInput.SetValue("")
+		m.exitAction = fmt.Sprintf("cd %q", msg.worktreePath)
+		return m, tea.Quit
 	case tea.WindowSizeMsg:
 		m.windowWidth = msg.Width
 		m.windowHeight = msg.Height
 		m.viewportHeight = msg.Height - 8
 	case clearStatusMsg:
 		m.statusMessage = ""
+	case dirtyWorktreeErr:
+		m.deletingWorktree = false
+		m.deletingPath = ""
+		m.statusMessage = "⚠️  Worktree has unsaved changes — clean up before deleting"
+		log.Printf("[DELETE] dirty worktree detected path=%s branch=%s", msg.worktree.Path, msg.worktree.Branch)
+		return m, clearStatusAfterDelay()
 	default:
 		// Handle errors from git operations
 		if err, ok := msg.(error); ok {
@@ -373,6 +426,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.deletingWorktree = false
 				m.deletingPath = ""
 			}
+			if m.creatingPR {
+				m.creatingPR = false
+			}
 			m.statusMessage = fmt.Sprintf("❌ Error: %v", err)
 			return m, clearStatusAfterDelay()
 		}
@@ -385,11 +441,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) View() string {
-	if m.creatingWorktree || m.creatingNewBranch {
+	if m.creatingWorktree || m.creatingNewBranch || m.creatingPR {
 		message := m.statusMessage
 		if message == "" {
 			if m.creatingNewBranch {
 				message = "⏳ Creating new branch and worktree..."
+			} else if m.creatingPR {
+				message = "⏳ Creating worktree from PR..."
 			} else {
 				message = "⏳ Creating worktree..."
 			}
@@ -438,6 +496,11 @@ func (m model) View() string {
 	}
 
 	if m.view == "worktrees" {
+		if m.prInputActive {
+			content.WriteString(inputStyle.Render("PR ref: "))
+			content.WriteString(m.prInput.View())
+			content.WriteString("\n\n")
+		}
 		if len(m.worktrees) == 0 {
 			content.WriteString(errorStyle.Render("No worktrees found."))
 			content.WriteString("\n")
@@ -459,7 +522,11 @@ func (m model) View() string {
 			}
 		}
 		
-		content.WriteString(helpStyle.Render("Press 'enter' to open in Cursor, 't' terminal, 'a' claude, 'c' claude -r, 'd' delete, 'r' refresh, 'tab' switch"))
+		if m.prInputActive {
+			content.WriteString(helpStyle.Render("Type a PR number, #123, or pull URL — 'enter' to create, 'esc' to cancel"))
+		} else {
+			content.WriteString(helpStyle.Render("'enter' terminal, 'a' claude, 'c' claude -r, 'd' delete, 'n' new branch, 'p' from PR, 'r' refresh, 'tab' switch"))
+		}
 	} else {
 		if m.creatingBranch {
 			content.WriteString(inputStyle.Render("New branch name: "))
@@ -663,7 +730,7 @@ func isValidBranchChar(s string) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '/' || c == '.'
 }
 
-func runNonInteractive(listWorktrees, listBranches *bool, createWorktreeFlag, deleteWorktreeFlag, createNewBranch *string) {
+func runNonInteractive(listWorktrees, listBranches *bool, createWorktreeFlag, deleteWorktreeFlag, createNewBranch, fromPR, cmdFile *string) {
 	if *listWorktrees {
 		worktrees, err := getWorktrees()
 		if err != nil {
@@ -754,6 +821,18 @@ func runNonInteractive(listWorktrees, listBranches *bool, createWorktreeFlag, de
 		}
 		fmt.Printf("Successfully created new branch '%s' and worktree\n", *createNewBranch)
 	}
+
+	if *fromPR != "" {
+		info, path, err := createPRWorktree(*fromPR)
+		if err != nil {
+			fmt.Printf("Error creating worktree from PR: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Successfully created worktree for PR #%d (%s) at %s\n", info.Number, info.HeadRefName, path)
+		if cmdFile != nil && *cmdFile != "" {
+			_ = os.WriteFile(*cmdFile, []byte(fmt.Sprintf("cd %q", path)), 0644)
+		}
+	}
 }
 
 func main() {
@@ -763,7 +842,9 @@ func main() {
 	createWorktreeFlag := flag.String("create-worktree", "", "Create a worktree for the specified branch")
 	deleteWorktreeFlag := flag.String("delete-worktree", "", "Delete the worktree at the specified path")
 	createNewBranch := flag.String("create-new-branch", "", "Create a new branch and worktree")
+	fromPR := flag.String("from-pr", "", "Create a worktree from a GitHub PR (number, #123, or pull URL)")
 	nonInteractive := flag.Bool("non-interactive", false, "Run in non-interactive mode")
+	cmdFile := flag.String("cmd-file", "", "File to write exit command to (used by shell wrapper)")
 	help := flag.Bool("help", false, "Show help message")
 
 	flag.Parse()
@@ -777,38 +858,77 @@ func main() {
 		fmt.Println("  wtree --create-worktree <branch>   Create a worktree for the specified branch")
 		fmt.Println("  wtree --delete-worktree <path>     Delete the worktree at the specified path")
 		fmt.Println("  wtree --create-new-branch <name>   Create a new branch and worktree")
+		fmt.Println("  wtree --from-pr <ref>              Create a worktree from a GitHub PR (number, #123, or pull URL)")
+		fmt.Println("  wtree --cmd-file <path>            Write exit command to file (for shell wrapper)")
 		fmt.Println("  wtree --help                Show this help message")
 		fmt.Println("\nExamples:")
 		fmt.Println("  wtree --create-worktree feature/new-feature")
 		fmt.Println("  wtree --delete-worktree ../playground-feature-new-feature")
 		fmt.Println("  wtree --create-new-branch bugfix/fix-issue")
+		fmt.Println("  wtree --from-pr 165334")
+		fmt.Println("  wtree --from-pr https://github.com/owner/repo/pull/123")
+		fmt.Println("\nShell wrapper (add to .zshrc):")
+		fmt.Println("  function wtree() {")
+		fmt.Println("    local tmp=$(mktemp -t \"wtree-cmd.XXXXXX\")")
+		fmt.Println("    command wtree --cmd-file=\"$tmp\" \"$@\"")
+		fmt.Println("    if [ -f \"$tmp\" ]; then")
+		fmt.Println("      local cmd=$(cat \"$tmp\")")
+		fmt.Println("      rm -f \"$tmp\"")
+		fmt.Println("      [ -n \"$cmd\" ] && eval \"$cmd\"")
+		fmt.Println("    fi")
+		fmt.Println("  }")
 		return
 	}
 
-	// Log current working directory
+	// Set up log file
+	logDir := filepath.Join(os.Getenv("HOME"), ".wtree")
+	if err := os.MkdirAll(logDir, 0755); err == nil {
+		logPath := filepath.Join(logDir, "wtree.log")
+		logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err == nil {
+			log.SetOutput(logFile)
+			log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
+			defer logFile.Close()
+		}
+	}
+
 	wd, err := os.Getwd()
 	if err != nil {
 		log.Printf("Warning: could not get working directory: %v", err)
 	} else {
-		log.Printf("wtree running from: %s", wd)
+		log.Printf("wtree %s started from: %s", version, wd)
 	}
 
-	// Check if we're in a git repository
-	if !isGitRepository() {
+	// Seed the repos config on first run so users can discover/edit it.
+	ensureSampleConfig()
+
+	// Check if we're in a git repository — skipped when --from-pr is given
+	// because resolveRepoRoot may pick a configured checkout instead of cwd.
+	if *fromPR == "" && !isGitRepository() {
 		fmt.Println("Error: wtree must be run from within a git repository")
 		fmt.Println("Please navigate to a git repository and try again.")
+		fmt.Printf("(or use --from-pr <url> with a repo configured in %s)\n", configPath())
 		os.Exit(1)
 	}
 
 	// Handle non-interactive commands
-	if *listWorktrees || *listBranches || *createWorktreeFlag != "" || *deleteWorktreeFlag != "" || *createNewBranch != "" || *nonInteractive {
-		runNonInteractive(listWorktrees, listBranches, createWorktreeFlag, deleteWorktreeFlag, createNewBranch)
+	if *listWorktrees || *listBranches || *createWorktreeFlag != "" || *deleteWorktreeFlag != "" || *createNewBranch != "" || *fromPR != "" || *nonInteractive {
+		runNonInteractive(listWorktrees, listBranches, createWorktreeFlag, deleteWorktreeFlag, createNewBranch, fromPR, cmdFile)
 		return
 	}
 
 	// Run interactive mode with alternate screen
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	finalModel, err := p.Run()
+	if err != nil {
 		log.Fatal(err)
+	}
+
+	// Write exit command to cmd-file if specified
+	m := finalModel.(model)
+	if m.exitAction != "" && *cmdFile != "" {
+		if writeErr := os.WriteFile(*cmdFile, []byte(m.exitAction), 0644); writeErr != nil {
+			log.Printf("Warning: could not write cmd-file: %v", writeErr)
+		}
 	}
 }

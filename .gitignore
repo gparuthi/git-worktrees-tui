@@ -1,2 +1,4 @@
-bin/.claude/settings.local.json
+bin/
+wtree
+.claude/settings.local.json
 git-worktrees-tui

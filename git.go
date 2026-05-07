@@ -2,12 +2,11 @@ package main
 
 import (
 	"fmt"
-	"os"
+	"log"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -21,6 +20,13 @@ type worktreeDeletedMsg struct{}
 type deletingWorktreeMsg struct{ path string }
 type worktreeCreatedMsg struct {
 	branch string
+}
+type dirtyWorktreeErr struct {
+	worktree Worktree
+}
+
+func (e dirtyWorktreeErr) Error() string {
+	return fmt.Sprintf("worktree %s has modified or untracked files", e.worktree.Path)
 }
 
 func getWorktreesCmd() tea.Cmd {
@@ -70,45 +76,6 @@ func performDeleteWorktreeCmd(worktree Worktree) tea.Cmd {
 	}
 }
 
-func openWorktreeCmd(worktree Worktree) tea.Cmd {
-	return func() tea.Msg {
-		err := openWorktree(worktree)
-		if err != nil {
-			return err
-		}
-		return nil
-	}
-}
-
-func openTerminalCmd(worktree Worktree) tea.Cmd {
-	return func() tea.Msg {
-		err := openTerminal(worktree)
-		if err != nil {
-			return err
-		}
-		return tea.Quit()
-	}
-}
-
-func openTerminalWithClaudeCmd(worktree Worktree) tea.Cmd {
-	return func() tea.Msg {
-		err := openTerminalWithClaude(worktree)
-		if err != nil {
-			return err
-		}
-		return tea.Quit()
-	}
-}
-
-func openTerminalWithClaudeRCmd(worktree Worktree) tea.Cmd {
-	return func() tea.Msg {
-		err := openTerminalWithClaudeR(worktree)
-		if err != nil {
-			return err
-		}
-		return tea.Quit()
-	}
-}
 
 func createNewBranchWorktreeCmd(branchName string) tea.Cmd {
 	return func() tea.Msg {
@@ -127,7 +94,14 @@ func performCreateNewBranchWorktreeCmd(branchName string) tea.Cmd {
 }
 
 func getWorktrees() ([]Worktree, error) {
+	return getWorktreesAt("")
+}
+
+func getWorktreesAt(repoRoot string) ([]Worktree, error) {
 	cmd := exec.Command("git", "worktree", "list", "--porcelain")
+	if repoRoot != "" {
+		cmd.Dir = repoRoot
+	}
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
@@ -255,6 +229,8 @@ func createWorktree(branch Branch) error {
 	branchName := strings.ReplaceAll(branch.Name, "/", "-")
 	worktreePath := filepath.Join(parentDir, repoName + "-" + branchName)
 	
+	log.Printf("[CREATE] creating worktree path=%s branch=%s type=%s", worktreePath, branch.Name, branch.Type)
+
 	var cmd *exec.Cmd
 	if branch.Type == "local" {
 		cmd = exec.Command("git", "worktree", "add", worktreePath, branch.Name)
@@ -262,30 +238,47 @@ func createWorktree(branch Branch) error {
 		localBranchName := strings.TrimPrefix(branch.Name, "origin/")
 		cmd = exec.Command("git", "worktree", "add", "-b", localBranchName, worktreePath, branch.Name)
 	}
-	
-	return cmd.Run()
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("[CREATE] failed: %v", err)
+		return err
+	}
+	log.Printf("[CREATE] succeeded")
+	return nil
 }
 
 func deleteWorktree(worktree Worktree) error {
+	mainRoot, err := getMainRepoRoot()
+	if err != nil {
+		log.Printf("[DELETE] failed to get main repo root: %v", err)
+		return fmt.Errorf("could not find main repo root: %w", err)
+	}
+
+	log.Printf("[DELETE] removing worktree path=%s branch=%s mainRoot=%s", worktree.Path, worktree.Branch, mainRoot)
+
+	// Prune stale worktrees first to clean up any dangling references
+	pruneCmd := exec.Command("git", "worktree", "prune")
+	pruneCmd.Dir = mainRoot
+	if pruneOut, pruneErr := pruneCmd.CombinedOutput(); pruneErr != nil {
+		log.Printf("[DELETE] prune warning: %v output=%s", pruneErr, strings.TrimSpace(string(pruneOut)))
+	}
+
 	cmd := exec.Command("git", "worktree", "remove", worktree.Path)
+	cmd.Dir = mainRoot
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// Try again with --force if the initial remove failed
-		cmdForce := exec.Command("git", "worktree", "remove", "--force", worktree.Path)
-		forceOutput, forceErr := cmdForce.CombinedOutput()
-		if forceErr != nil {
-			msg := strings.TrimSpace(string(forceOutput))
-			if msg == "" {
-				msg = strings.TrimSpace(string(output))
-			}
-			if msg != "" {
-				return fmt.Errorf("%s", msg)
-			}
-			return forceErr
+		outStr := strings.TrimSpace(string(output))
+		log.Printf("[DELETE] initial remove failed: %v output=%s", err, outStr)
+		// If dirty worktree, ask user to confirm force delete
+		if strings.Contains(outStr, "modified or untracked files") {
+			return dirtyWorktreeErr{worktree: worktree}
 		}
+		return fmt.Errorf("%s", outStr)
 	}
+	log.Printf("[DELETE] remove succeeded")
 	return nil
 }
+
 
 func getRepoName() (string, error) {
 	repoRoot, err := getMainRepoRoot()
@@ -349,8 +342,14 @@ func createNewBranchWorktree(branchName string) error {
 	sanitizedBranchName := strings.ReplaceAll(branchName, "/", "-")
 	worktreePath := filepath.Join(parentDir, repoName + "-" + sanitizedBranchName)
 	
+	log.Printf("[CREATE] new branch worktree path=%s branch=%s base=%s", worktreePath, branchName, mainBranch)
 	cmd := exec.Command("git", "worktree", "add", "--no-track", "-b", branchName, worktreePath, mainBranch)
-	return cmd.Run()
+	if err := cmd.Run(); err != nil {
+		log.Printf("[CREATE] new branch failed: %v", err)
+		return err
+	}
+	log.Printf("[CREATE] new branch succeeded")
+	return nil
 }
 
 func getOriginMainBranch() (string, error) {
@@ -382,58 +381,20 @@ func getOriginMainBranch() (string, error) {
 	return "", fmt.Errorf("could not parse origin main branch reference")
 }
 
-func openWorktree(worktree Worktree) error {
-	cmd := exec.Command("cursor", worktree.Path)
-	return cmd.Run()
-}
-
-func openTerminal(worktree Worktree) error {
-	// Change to the worktree directory
-	if err := os.Chdir(worktree.Path); err != nil {
-		return fmt.Errorf("failed to change directory: %w", err)
-	}
-
-	// Find zsh binary
-	zshPath, err := exec.LookPath("zsh")
+// worktreePathFor returns the worktree path that would be created for a branch
+// of the given name. Used to "cd" into a freshly created worktree when exiting
+// the TUI.
+func worktreePathFor(branchName string) string {
+	repoName, err := getRepoName()
 	if err != nil {
-		return fmt.Errorf("zsh not found: %w", err)
+		return ""
 	}
-
-	// Replace current process with zsh
-	// This will close wtree and start zsh in the worktree directory
-	return syscall.Exec(zshPath, []string{"zsh"}, os.Environ())
-}
-
-func openTerminalWithClaude(worktree Worktree) error {
-	// Change to the worktree directory
-	if err := os.Chdir(worktree.Path); err != nil {
-		return fmt.Errorf("failed to change directory: %w", err)
-	}
-
-	// Find claude binary
-	claudePath, err := exec.LookPath("claude")
+	repoRoot, err := getMainRepoRoot()
 	if err != nil {
-		return fmt.Errorf("claude not found: %w", err)
+		return ""
 	}
-
-	// Replace current process with claude
-	return syscall.Exec(claudePath, []string{"claude"}, os.Environ())
-}
-
-func openTerminalWithClaudeR(worktree Worktree) error {
-	// Change to the worktree directory
-	if err := os.Chdir(worktree.Path); err != nil {
-		return fmt.Errorf("failed to change directory: %w", err)
-	}
-
-	// Find claude binary
-	claudePath, err := exec.LookPath("claude")
-	if err != nil {
-		return fmt.Errorf("claude not found: %w", err)
-	}
-
-	// Replace current process with claude -r
-	return syscall.Exec(claudePath, []string{"claude", "-r"}, os.Environ())
+	sanitized := strings.ReplaceAll(branchName, "/", "-")
+	return filepath.Join(filepath.Dir(repoRoot), repoName+"-"+sanitized)
 }
 
 func isGitRepository() bool {
