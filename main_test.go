@@ -31,16 +31,16 @@ func TestInitialModel(t *testing.T) {
 		t.Error("Expected creatingBranch to be false initially")
 	}
 
-	if model.deletingWorktree {
-		t.Error("Expected deletingWorktree to be false initially")
+	if model.deleteActive || len(model.deleteQueue) != 0 {
+		t.Error("Expected no active or queued deletions initially")
 	}
 
-	if model.newBranchName != "" {
-		t.Errorf("Expected newBranchName to be empty initially, got %q", model.newBranchName)
+	if model.newBranchInput.Value() != "" {
+		t.Errorf("Expected newBranchName to be empty initially, got %q", model.newBranchInput.Value())
 	}
 
-	if model.filterText != "" {
-		t.Errorf("Expected filterText to be empty initially, got %q", model.filterText)
+	if model.filterInput.Value() != "" {
+		t.Errorf("Expected filterText to be empty initially, got %q", model.filterInput.Value())
 	}
 }
 
@@ -110,8 +110,8 @@ func TestModelUpdate_BranchCreation(t *testing.T) {
 		t.Error("Expected creatingBranch to be true after pressing 'n'")
 	}
 
-	if m.newBranchName != "" {
-		t.Errorf("Expected newBranchName to be empty initially, got %q", m.newBranchName)
+	if m.newBranchInput.Value() != "" {
+		t.Errorf("Expected newBranchName to be empty initially, got %q", m.newBranchInput.Value())
 	}
 
 	// Type valid characters
@@ -123,8 +123,8 @@ func TestModelUpdate_BranchCreation(t *testing.T) {
 	}
 
 	expected := "feature-branch"
-	if m.newBranchName != expected {
-		t.Errorf("Expected newBranchName to be %q, got %q", expected, m.newBranchName)
+	if m.newBranchInput.Value() != expected {
+		t.Errorf("Expected newBranchName to be %q, got %q", expected, m.newBranchInput.Value())
 	}
 
 	// Test the 'd' key specifically (this was the bug we fixed)
@@ -133,8 +133,8 @@ func TestModelUpdate_BranchCreation(t *testing.T) {
 	m = newModel.(model)
 
 	expected = "feature-branchd"
-	if m.newBranchName != expected {
-		t.Errorf("Expected 'd' to be added to branch name, got %q", m.newBranchName)
+	if m.newBranchInput.Value() != expected {
+		t.Errorf("Expected 'd' to be added to branch name, got %q", m.newBranchInput.Value())
 	}
 
 	// Test backspace
@@ -143,8 +143,8 @@ func TestModelUpdate_BranchCreation(t *testing.T) {
 	m = newModel.(model)
 
 	expected = "feature-branch"
-	if m.newBranchName != expected {
-		t.Errorf("Expected backspace to remove last character, got %q", m.newBranchName)
+	if m.newBranchInput.Value() != expected {
+		t.Errorf("Expected backspace to remove last character, got %q", m.newBranchInput.Value())
 	}
 
 	// Test escape to cancel
@@ -156,8 +156,8 @@ func TestModelUpdate_BranchCreation(t *testing.T) {
 		t.Error("Expected creatingBranch to be false after pressing escape")
 	}
 
-	if m.newBranchName != "" {
-		t.Errorf("Expected newBranchName to be empty after escape, got %q", m.newBranchName)
+	if m.newBranchInput.Value() != "" {
+		t.Errorf("Expected newBranchName to be empty after escape, got %q", m.newBranchInput.Value())
 	}
 
 	if m.view != "branches" {
@@ -193,8 +193,8 @@ func TestModelUpdate_Filtering(t *testing.T) {
 	}
 
 	expected := "feature"
-	if m.filterText != expected {
-		t.Errorf("Expected filterText to be %q, got %q", expected, m.filterText)
+	if m.filterInput.Value() != expected {
+		t.Errorf("Expected filterText to be %q, got %q", expected, m.filterInput.Value())
 	}
 
 	// Test backspace in filter mode
@@ -203,8 +203,8 @@ func TestModelUpdate_Filtering(t *testing.T) {
 	m = newModel.(model)
 
 	expected = "featur"
-	if m.filterText != expected {
-		t.Errorf("Expected filterText after backspace to be %q, got %q", expected, m.filterText)
+	if m.filterInput.Value() != expected {
+		t.Errorf("Expected filterText after backspace to be %q, got %q", expected, m.filterInput.Value())
 	}
 
 	// Test escape to cancel filtering
@@ -216,8 +216,8 @@ func TestModelUpdate_Filtering(t *testing.T) {
 		t.Error("Expected filtering to be false after pressing escape")
 	}
 
-	if m.filterText != "" {
-		t.Errorf("Expected filterText to be empty after escape, got %q", m.filterText)
+	if m.filterInput.Value() != "" {
+		t.Errorf("Expected filterText to be empty after escape, got %q", m.filterInput.Value())
 	}
 
 	if len(m.branches) != len(m.allBranches) {
@@ -311,7 +311,7 @@ func TestFilterBranches(t *testing.T) {
 		{Name: "bugfix-branch", Type: "local"},
 		{Name: "release-v1.0", Type: "local"},
 	}
-	m.filterText = "feature"
+	m.filterInput.SetValue("feature")
 
 	m.filterBranches()
 
@@ -324,7 +324,7 @@ func TestFilterBranches(t *testing.T) {
 	}
 
 	// Test case-insensitive filtering
-	m.filterText = "FEATURE"
+	m.filterInput.SetValue("FEATURE")
 	m.filterBranches()
 
 	if len(m.branches) != 1 {
@@ -332,7 +332,7 @@ func TestFilterBranches(t *testing.T) {
 	}
 
 	// Test filtering with multiple matches
-	m.filterText = "branch"
+	m.filterInput.SetValue("branch")
 	m.filterBranches()
 
 	if len(m.branches) != 2 {
@@ -340,7 +340,7 @@ func TestFilterBranches(t *testing.T) {
 	}
 
 	// Test empty filter
-	m.filterText = ""
+	m.filterInput.SetValue("")
 	m.filterBranches()
 
 	if len(m.branches) != len(m.allBranches) {

@@ -1,4 +1,7 @@
 bin/
 wtree
+
+# Local repo map (owner/repo -> checkout path); never commit
+repos.yaml
 .claude/settings.local.json
 git-worktrees-tui

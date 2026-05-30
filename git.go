@@ -3,8 +3,10 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -16,8 +18,12 @@ type worktreesMsg []Worktree
 type branchesMsg []Branch
 type newBranchCreatedMsg struct{}
 type newBranchCreatingMsg struct{ branchName string }
-type worktreeDeletedMsg struct{}
-type deletingWorktreeMsg struct{ path string }
+
+// deleteDoneMsg reports the result of one queued deletion (err is nil on success).
+type deleteDoneMsg struct {
+	path string
+	err  error
+}
 type worktreeCreatedMsg struct {
 	branch string
 }
@@ -59,20 +65,12 @@ func createWorktreeCmd(branch Branch) tea.Cmd {
 	}
 }
 
-func deleteWorktreeCmd(worktree Worktree) tea.Cmd {
+// processDeleteCmd performs one deletion in the background and reports the
+// result. Deletions are run one at a time (serialized by the model) because
+// `git worktree remove`/`prune` mutate shared repo state.
+func processDeleteCmd(worktree Worktree) tea.Cmd {
 	return func() tea.Msg {
-		// First send a message that we're starting to delete
-		return deletingWorktreeMsg{path: worktree.Path}
-	}
-}
-
-func performDeleteWorktreeCmd(worktree Worktree) tea.Cmd {
-	return func() tea.Msg {
-		err := deleteWorktree(worktree)
-		if err != nil {
-			return err
-		}
-		return worktreeDeletedMsg{}
+		return deleteDoneMsg{path: worktree.Path, err: deleteWorktree(worktree)}
 	}
 }
 
@@ -130,6 +128,20 @@ func getWorktreesAt(repoRoot string) ([]Worktree, error) {
 		worktrees = append(worktrees, currentWorktree)
 	}
 
+	mtimes := make(map[string]time.Time, len(worktrees))
+	for _, wt := range worktrees {
+		if info, err := os.Stat(wt.Path); err == nil {
+			mtimes[wt.Path] = info.ModTime()
+		}
+	}
+	sort.SliceStable(worktrees, func(i, j int) bool {
+		return mtimes[worktrees[i].Path].After(mtimes[worktrees[j].Path])
+	})
+
+	// NOTE: local git enrichment (last commit / dirty / ahead) is intentionally
+	// NOT done here — `git status` is slow on large monorepos and would block
+	// the list from rendering. The TUI enriches asynchronously via
+	// enrichWorktreesCmd; the non-interactive path calls enrichWorktreesLocal.
 	return worktrees, nil
 }
 
@@ -215,19 +227,13 @@ func getRemoteBranches() ([]Branch, error) {
 }
 
 func createWorktree(branch Branch) error {
-	repoName, err := getRepoName()
+	parentDir, repoName, err := preferredWorktreeParent()
 	if err != nil {
 		return err
 	}
-	
-	repoRoot, err := getMainRepoRoot()
-	if err != nil {
-		return err
-	}
-	
-	parentDir := filepath.Dir(repoRoot)
+
 	branchName := strings.ReplaceAll(branch.Name, "/", "-")
-	worktreePath := filepath.Join(parentDir, repoName + "-" + branchName)
+	worktreePath := filepath.Join(parentDir, repoName+"-"+branchName)
 	
 	log.Printf("[CREATE] creating worktree path=%s branch=%s type=%s", worktreePath, branch.Name, branch.Type)
 
@@ -276,17 +282,19 @@ func deleteWorktree(worktree Worktree) error {
 		return fmt.Errorf("%s", outStr)
 	}
 	log.Printf("[DELETE] remove succeeded")
+
+	// Record enough to undo (the branch + commits survive `git worktree remove`).
+	if logErr := logDeletion(DeletionRecord{
+		Path:     worktree.Path,
+		Branch:   worktree.Branch,
+		Head:     worktree.Head,
+		RepoRoot: mainRoot,
+	}); logErr != nil {
+		log.Printf("[DELETE] failed to write deletion log: %v", logErr)
+	}
 	return nil
 }
 
-
-func getRepoName() (string, error) {
-	repoRoot, err := getMainRepoRoot()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Base(repoRoot), nil
-}
 
 func getRepoRoot() (string, error) {
 	cmd := exec.Command("git", "rev-parse", "--show-toplevel")
@@ -322,25 +330,19 @@ func getMainRepoRoot() (string, error) {
 }
 
 func createNewBranchWorktree(branchName string) error {
-	repoName, err := getRepoName()
+	parentDir, repoName, err := preferredWorktreeParent()
 	if err != nil {
 		return err
 	}
-	
-	repoRoot, err := getMainRepoRoot()
-	if err != nil {
-		return err
-	}
-	
+
 	// Find the main branch from origin (origin/main or origin/master)
 	mainBranch, err := getOriginMainBranch()
 	if err != nil {
 		return err
 	}
-	
-	parentDir := filepath.Dir(repoRoot)
+
 	sanitizedBranchName := strings.ReplaceAll(branchName, "/", "-")
-	worktreePath := filepath.Join(parentDir, repoName + "-" + sanitizedBranchName)
+	worktreePath := filepath.Join(parentDir, repoName+"-"+sanitizedBranchName)
 	
 	log.Printf("[CREATE] new branch worktree path=%s branch=%s base=%s", worktreePath, branchName, mainBranch)
 	cmd := exec.Command("git", "worktree", "add", "--no-track", "-b", branchName, worktreePath, mainBranch)
@@ -350,6 +352,59 @@ func createNewBranchWorktree(branchName string) error {
 	}
 	log.Printf("[CREATE] new branch succeeded")
 	return nil
+}
+
+type reuseBranchDoneMsg struct {
+	path   string
+	branch string
+}
+
+// reuseBranchCmd switches an existing worktree onto a brand-new branch off
+// origin/master, in place — for reusing a worktree after its PR merged.
+func reuseBranchCmd(path, branch string) tea.Cmd {
+	return func() tea.Msg {
+		if err := reuseWorktreeBranch(path, branch); err != nil {
+			return err
+		}
+		return reuseBranchDoneMsg{path: path, branch: branch}
+	}
+}
+
+func reuseWorktreeBranch(path, branch string) error {
+	base, err := originMainBranchAt(path)
+	if err != nil {
+		return err
+	}
+	log.Printf("[REUSE] worktree=%s new branch=%s base=%s", path, branch, base)
+	cmd := exec.Command("git", "switch", "--no-track", "-c", branch, base)
+	cmd.Dir = path
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git switch: %s", strings.TrimSpace(string(out)))
+	}
+	log.Printf("[REUSE] succeeded")
+	return nil
+}
+
+// originMainBranchAt is getOriginMainBranch but scoped to a specific worktree dir.
+func originMainBranchAt(dir string) (string, error) {
+	for _, ref := range []string{"origin/main", "origin/master"} {
+		cmd := exec.Command("git", "rev-parse", "--verify", ref)
+		cmd.Dir = dir
+		if cmd.Run() == nil {
+			return ref, nil
+		}
+	}
+	cmd := exec.Command("git", "symbolic-ref", "refs/remotes/origin/HEAD")
+	cmd.Dir = dir
+	output, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("could not find origin main branch (tried origin/main, origin/master)")
+	}
+	ref := strings.TrimSpace(string(output))
+	if strings.HasPrefix(ref, "refs/remotes/") {
+		return strings.TrimPrefix(ref, "refs/remotes/"), nil
+	}
+	return "", fmt.Errorf("could not parse origin main branch reference")
 }
 
 func getOriginMainBranch() (string, error) {
@@ -385,16 +440,69 @@ func getOriginMainBranch() (string, error) {
 // of the given name. Used to "cd" into a freshly created worktree when exiting
 // the TUI.
 func worktreePathFor(branchName string) string {
-	repoName, err := getRepoName()
-	if err != nil {
-		return ""
-	}
-	repoRoot, err := getMainRepoRoot()
+	parentDir, repoName, err := preferredWorktreeParent()
 	if err != nil {
 		return ""
 	}
 	sanitized := strings.ReplaceAll(branchName, "/", "-")
-	return filepath.Join(filepath.Dir(repoRoot), repoName+"-"+sanitized)
+	return filepath.Join(parentDir, repoName+"-"+sanitized)
+}
+
+// preferredWorktreeParent returns the parent directory where new worktrees
+// should be created and the basename to use as the repo prefix.
+//
+// If origin's owner/repo matches a repos.yaml entry, the parent is derived
+// from the configured path — so all worktrees for the repo live under one
+// directory regardless of where the main worktree happens to be on disk.
+// Otherwise this falls back to the historical behavior of placing worktrees
+// next to the main worktree.
+func preferredWorktreeParent() (parentDir, repoName string, err error) {
+	repoRoot, err := getMainRepoRoot()
+	if err != nil {
+		return "", "", err
+	}
+	fallbackParent := filepath.Dir(repoRoot)
+	fallbackName := filepath.Base(repoRoot)
+
+	owner, repo, ok := originOwnerRepo(repoRoot)
+	if !ok {
+		return fallbackParent, fallbackName, nil
+	}
+	cfg, cfgErr := loadConfig()
+	if cfgErr != nil {
+		log.Printf("[CONFIG] load failed: %v (using cwd-based parent)", cfgErr)
+		return fallbackParent, fallbackName, nil
+	}
+	configured := cfg.findRepoPath(owner, repo)
+	if configured == "" {
+		return fallbackParent, fallbackName, nil
+	}
+	if _, statErr := os.Stat(configured); statErr != nil {
+		log.Printf("[CONFIG] %s/%s maps to %s but path missing: %v (using cwd-based parent)", owner, repo, configured, statErr)
+		return fallbackParent, fallbackName, nil
+	}
+	log.Printf("[CONFIG] %s/%s -> configured parent %s", owner, repo, filepath.Dir(configured))
+	return filepath.Dir(configured), filepath.Base(configured), nil
+}
+
+var originURLRe = regexp.MustCompile(`github\.com[/:]([^/]+)/([^/?#]+?)(?:\.git)?$`)
+
+// originOwnerRepo extracts the owner and repo from the `origin` remote URL at
+// repoRoot. Handles both SSH (git@github.com:owner/repo.git) and HTTPS
+// (https://github.com/owner/repo[.git]) forms. Returns ok=false if origin is
+// missing or doesn't look like a GitHub URL.
+func originOwnerRepo(repoRoot string) (owner, repo string, ok bool) {
+	cmd := exec.Command("git", "remote", "get-url", "origin")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
+	if err != nil {
+		return "", "", false
+	}
+	url := strings.TrimSpace(string(out))
+	if m := originURLRe.FindStringSubmatch(url); len(m) == 3 {
+		return m[1], m[2], true
+	}
+	return "", "", false
 }
 
 func isGitRepository() bool {

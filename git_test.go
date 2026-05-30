@@ -146,3 +146,30 @@ func TestGitError(t *testing.T) {
 */
 
 // Note: sanitizeBranchName function doesn't exist in current codebase
+
+func TestOriginURLRe(t *testing.T) {
+	tests := []struct {
+		url   string
+		owner string
+		repo  string
+	}{
+		{"git@github.com:acme/example-repo.git", "acme", "example-repo"},
+		{"git@github.com:acme/example-repo", "acme", "example-repo"},
+		{"https://github.com/acme/example-repo.git", "acme", "example-repo"},
+		{"https://github.com/acme/example-repo", "acme", "example-repo"},
+		{"https://github.com/gparuthi/playground.git", "gparuthi", "playground"},
+		{"ssh://git@github.com/acme/example-repo.git", "acme", "example-repo"},
+		{"not-a-url", "", ""},
+		{"https://gitlab.com/foo/bar.git", "", ""},
+	}
+	for _, tc := range tests {
+		m := originURLRe.FindStringSubmatch(tc.url)
+		var owner, repo string
+		if len(m) == 3 {
+			owner, repo = m[1], m[2]
+		}
+		if owner != tc.owner || repo != tc.repo {
+			t.Errorf("originURLRe(%q) = (%q, %q), want (%q, %q)", tc.url, owner, repo, tc.owner, tc.repo)
+		}
+	}
+}
