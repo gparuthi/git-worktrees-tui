@@ -33,8 +33,9 @@ type model struct {
 	creatingBranch       bool
 	windowWidth          int
 	windowHeight         int
-	deletingWorktree     bool
-	deletingPath         string
+	deleteQueue          []Worktree      // worktrees waiting to be deleted
+	deleting             map[string]bool // paths queued or in-progress (for rendering)
+	deleteActive         bool            // a deletion is currently running (serialized)
 	creatingWorktree     bool
 	creatingForBranch    string
 	creatingNewBranch    bool
@@ -44,12 +45,20 @@ type model struct {
 	creatingPR           bool
 	prInputActive        bool
 	prInput              textinput.Model
+	prStatuses           map[string]*PRStatus // branch -> PR (nil = no PR; absent = not loaded)
+	prLoading            bool
+	reuseBranchActive    bool   // alt+n: typing a new branch name to switch the selected worktree onto
+	reuseWorktreePath    string // worktree dir to reuse for the new branch
 }
 
 type Worktree struct {
 	Path   string
 	Branch string
 	Head   string
+	// Local git metadata, filled in by enrichWorktreesLocal.
+	LastCommit time.Time // committer date of HEAD
+	Dirty      bool      // has modified/untracked files
+	Ahead      int       // commits ahead of upstream (0 if no upstream)
 }
 
 type Branch struct {
@@ -103,9 +112,24 @@ var (
 	
 	branchTypeStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#10B981"))
-	
+
 	remoteBranchTypeStyle = lipgloss.NewStyle().
 				Foreground(lipgloss.Color("#F59E0B"))
+
+	// Worktree status badges (last commit age, local changes, PR state).
+	metaAgeStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280"))            // gray
+	metaDirtyStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#F59E0B")).Bold(true) // amber
+	metaAheadStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#3B82F6"))            // blue
+	metaDimStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#4B5563"))            // faint
+
+	prMergedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#A855F7")) // purple — safe to delete
+	prOpenStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#10B981")) // green
+	prClosedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")) // red
+
+	// Worktree table chrome.
+	tableHeaderStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#6B7280")).Bold(true)
+	tableBranchStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#9CA3AF")) // secondary
+	tableSelectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#FFFFFF")).Background(lipgloss.Color("#7C3AED")).Bold(true)
 )
 
 func initialModel() model {
@@ -133,8 +157,7 @@ func initialModel() model {
 		creatingBranch:        false,
 		windowWidth:           80,
 		windowHeight:          24,
-		deletingWorktree:      false,
-		deletingPath:          "",
+		deleting:              make(map[string]bool),
 		creatingWorktree:      false,
 		creatingForBranch:     "",
 		creatingNewBranch:     false,
@@ -143,6 +166,7 @@ func initialModel() model {
 		filterInput:           filterInput,
 		newBranchInput:        newBranchInput,
 		prInput:               prInput,
+		prStatuses:            make(map[string]*PRStatus),
 	}
 }
 
@@ -174,7 +198,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.filterBranches()
 	}
 	
-	if m.creatingBranch {
+	if m.creatingBranch || m.reuseBranchActive {
 		m.newBranchInput, cmd = m.newBranchInput.Update(msg)
 		if cmd != nil {
 			cmds = append(cmds, cmd)
@@ -193,7 +217,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		keyStr := msg.String()
 		
 		// If we're filtering, creating a branch, or entering a PR ref, let the text input handle most keys
-		if m.filtering || m.creatingBranch || m.prInputActive {
+		if m.filtering || m.creatingBranch || m.prInputActive || m.reuseBranchActive {
 			switch keyStr {
 			case "ctrl+c":
 				return m, tea.Quit
@@ -204,6 +228,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.filterInput.Blur()
 					m.branches = m.allBranches
 					m.cursor = 0
+				} else if m.reuseBranchActive {
+					m.reuseBranchActive = false
+					m.reuseWorktreePath = ""
+					m.newBranchInput.SetValue("")
+					m.newBranchInput.Blur()
 				} else if m.creatingBranch {
 					m.creatingBranch = false
 					m.newBranchInput.SetValue("")
@@ -215,7 +244,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.prInput.Blur()
 				}
 			case "enter":
-				if m.prInputActive && strings.TrimSpace(m.prInput.Value()) != "" {
+				if m.reuseBranchActive && strings.TrimSpace(m.newBranchInput.Value()) != "" {
+					name := strings.TrimSpace(m.newBranchInput.Value())
+					path := m.reuseWorktreePath
+					m.reuseBranchActive = false
+					m.reuseWorktreePath = ""
+					m.newBranchInput.Blur()
+					m.statusMessage = fmt.Sprintf("Creating branch '%s' off origin/master...", name)
+					return m, reuseBranchCmd(path, name)
+				} else if m.prInputActive && strings.TrimSpace(m.prInput.Value()) != "" {
 					ref := strings.TrimSpace(m.prInput.Value())
 					m.prInputActive = false
 					m.prInput.Blur()
@@ -309,10 +346,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = m.filterInput.Focus()
 			cmds = append(cmds, cmd)
 			
-		case keyStr == "n" && !m.filtering && !m.creatingBranch && !m.prInputActive:
+		case keyStr == "n" && !m.filtering && !m.creatingBranch && !m.prInputActive && !m.reuseBranchActive:
 			// 'n' works from any view; the input is rendered in the branches view, so switch.
 			m.view = "branches"
 			m.creatingBranch = true
+			m.newBranchInput.SetValue("")
+			m.newBranchInput.Focus()
+			cmd = m.newBranchInput.Focus()
+			cmds = append(cmds, cmd)
+
+		case keyStr == "alt+n" && !m.filtering && !m.creatingBranch && !m.prInputActive && !m.reuseBranchActive && m.view == "worktrees" && len(m.worktrees) > 0:
+			// alt+n reuses the selected worktree: switch it onto a fresh branch
+			// off origin/master (e.g. after its PR merged) without creating a new dir.
+			m.reuseBranchActive = true
+			m.reuseWorktreePath = m.worktrees[m.cursor].Path
 			m.newBranchInput.SetValue("")
 			m.newBranchInput.Focus()
 			cmd = m.newBranchInput.Focus()
@@ -325,8 +372,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd = m.prInput.Focus()
 			cmds = append(cmds, cmd)
 			
-		case keyStr == "d" && !m.filtering && !m.creatingBranch && !m.deletingWorktree && m.view == "worktrees" && len(m.worktrees) > 0:
-			return m, deleteWorktreeCmd(m.worktrees[m.cursor])
+		case keyStr == "d" && !m.filtering && !m.creatingBranch && m.view == "worktrees" && len(m.worktrees) > 0:
+			// Queue the selected worktree for background deletion. Deletions run
+			// one at a time so the UI stays responsive while several are queued.
+			wt := m.worktrees[m.cursor]
+			if !m.deleting[wt.Path] {
+				m.deleting[wt.Path] = true
+				m.deleteQueue = append(m.deleteQueue, wt)
+			}
+			if m.cursor < len(m.worktrees)-1 { // advance so repeated 'd' queues the next
+				m.cursor++
+				m.adjustScrollOffset()
+			}
+			if !m.deleteActive {
+				return m, m.startNextDelete()
+			}
+			return m, nil
+
+		case keyStr == "u" && !m.filtering && !m.creatingBranch && !m.prInputActive && !m.reuseBranchActive && m.view == "worktrees":
+			m.statusMessage = "↩️  Restoring last deleted worktree..."
+			return m, undoLastDeletionCmd()
+
+		case keyStr == "o" && !m.filtering && !m.creatingBranch && !m.prInputActive && !m.reuseBranchActive:
+			// -t forces the default text editor so the .jsonl opens for reading.
+			return m, tea.ExecProcess(exec.Command("open", "-t", ensureDeletionsLog()), nil)
 
 		case keyStr == "a" && !m.filtering && !m.creatingBranch && m.view == "worktrees" && len(m.worktrees) > 0:
 			m.exitAction = fmt.Sprintf("cd %q && claude", m.worktrees[m.cursor].Path)
@@ -344,6 +413,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case worktreesMsg:
 		m.worktrees = []Worktree(msg)
+		// The list renders now; the slow bits (local git status + the
+		// network-bound PR lookup) fill in their badges asynchronously.
+		m.prLoading = true
+		cmds = append(cmds, enrichWorktreesCmd(m.worktrees), getPRStatusesCmd(m.worktrees))
+	case worktreesEnrichedMsg:
+		m.mergeEnriched([]Worktree(msg))
+	case prStatusesMsg:
+		m.prStatuses = map[string]*PRStatus(msg)
+		m.prLoading = false
+	case reuseBranchDoneMsg:
+		m.statusMessage = fmt.Sprintf("✓ Worktree now on new branch '%s'", msg.branch)
+		return m, tea.Batch(getWorktreesCmd(), getBranchesCmd(), clearStatusAfterDelay())
 	case branchesMsg:
 		m.allBranches = []Branch(msg)
 		m.branches = m.allBranches
@@ -367,20 +448,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.exitAction = fmt.Sprintf("cd %q", path)
 		}
 		return m, tea.Quit
-	case deletingWorktreeMsg:
-		m.deletingWorktree = true
-		m.deletingPath = msg.path
-		// Find the worktree to delete
-		for _, worktree := range m.worktrees {
-			if worktree.Path == msg.path {
-				return m, performDeleteWorktreeCmd(worktree)
+	case deleteDoneMsg:
+		delete(m.deleting, msg.path)
+		if msg.err != nil {
+			if de, ok := msg.err.(dirtyWorktreeErr); ok {
+				m.statusMessage = fmt.Sprintf("⚠️  Skipped %s — unsaved changes", filepath.Base(de.worktree.Path))
+			} else {
+				m.statusMessage = fmt.Sprintf("❌ Delete failed: %v", msg.err)
 			}
+		} else {
+			m.removeWorktreeByPath(msg.path)
+			m.statusMessage = fmt.Sprintf("🗑️  Deleted %s — press 'u' to undo", filepath.Base(msg.path))
 		}
-		return m, nil
-	case worktreeDeletedMsg:
-		m.deletingWorktree = false
-		m.deletingPath = ""
-		return m, getWorktreesCmd()
+		batch := []tea.Cmd{clearStatusAfterDelay()}
+		if next := m.startNextDelete(); next != nil {
+			batch = append(batch, next)
+		}
+		return m, tea.Batch(batch...)
+	case undoDoneMsg:
+		m.statusMessage = fmt.Sprintf("↩️  Restored worktree '%s'", filepath.Base(msg.path))
+		return m, tea.Batch(getWorktreesCmd(), getBranchesCmd(), clearStatusAfterDelay())
+	case undoNothingMsg:
+		m.statusMessage = "Nothing to undo"
+		return m, clearStatusAfterDelay()
 	case worktreeCreatedMsg:
 		// Created from branches view — drop straight into a shell at the new worktree
 		m.creatingWorktree = false
@@ -402,15 +492,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.windowWidth = msg.Width
 		m.windowHeight = msg.Height
-		m.viewportHeight = msg.Height - 8
+		m.viewportHeight = msg.Height - 9 // -1 vs before to make room for the table header row
 	case clearStatusMsg:
 		m.statusMessage = ""
-	case dirtyWorktreeErr:
-		m.deletingWorktree = false
-		m.deletingPath = ""
-		m.statusMessage = "⚠️  Worktree has unsaved changes — clean up before deleting"
-		log.Printf("[DELETE] dirty worktree detected path=%s branch=%s", msg.worktree.Path, msg.worktree.Branch)
-		return m, clearStatusAfterDelay()
 	default:
 		// Handle errors from git operations
 		if err, ok := msg.(error); ok {
@@ -421,10 +505,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.creatingWorktree {
 				m.creatingWorktree = false
 				m.creatingForBranch = ""
-			}
-			if m.deletingWorktree {
-				m.deletingWorktree = false
-				m.deletingPath = ""
 			}
 			if m.creatingPR {
 				m.creatingPR = false
@@ -501,17 +581,25 @@ func (m model) View() string {
 			content.WriteString(m.prInput.View())
 			content.WriteString("\n\n")
 		}
+		if m.reuseBranchActive {
+			content.WriteString(inputStyle.Render("New branch off origin/master (reuse this worktree): "))
+			content.WriteString(m.newBranchInput.View())
+			content.WriteString("\n\n")
+		}
 		if len(m.worktrees) == 0 {
 			content.WriteString(errorStyle.Render("No worktrees found."))
 			content.WriteString("\n")
 		} else {
+			cols := m.worktreeColWidths()
+			content.WriteString(m.renderWorktreeHeader(cols))
+			content.WriteString("\n")
 			start, end := m.getViewportRange(len(m.worktrees))
 			for i := start; i < end; i++ {
 				if i >= len(m.worktrees) {
 					break
 				}
 				worktree := m.worktrees[i]
-				itemContent := m.renderWorktreeItem(worktree, i == m.cursor)
+				itemContent := m.renderWorktreeItem(worktree, i == m.cursor, cols)
 				content.WriteString(itemContent)
 				content.WriteString("\n")
 			}
@@ -524,8 +612,10 @@ func (m model) View() string {
 		
 		if m.prInputActive {
 			content.WriteString(helpStyle.Render("Type a PR number, #123, or pull URL — 'enter' to create, 'esc' to cancel"))
+		} else if m.reuseBranchActive {
+			content.WriteString(helpStyle.Render("Name the new branch (off origin/master, reuses this worktree) — 'enter' to create, 'esc' to cancel"))
 		} else {
-			content.WriteString(helpStyle.Render("'enter' terminal, 'a' claude, 'c' claude -r, 'd' delete, 'n' new branch, 'p' from PR, 'r' refresh, 'tab' switch"))
+			content.WriteString(helpStyle.Render("'enter' terminal, 'a' claude, 'c' claude -r, 'd' delete, 'u' undo, 'n' new branch, '⌥n' branch here, 'p' from PR, 'o' del-log, 'r' refresh, 'tab' switch"))
 		}
 	} else {
 		if m.creatingBranch {
@@ -615,25 +705,229 @@ func (m model) renderHeader() string {
 	)
 }
 
-func (m model) renderWorktreeItem(worktree Worktree, selected bool) string {
-	// Shorten path for display
-	displayPath := worktree.Path
-	if len(displayPath) > 50 {
-		displayPath = "..." + displayPath[len(displayPath)-47:]
+// colWidths holds the computed column widths for the worktree table.
+type colWidths struct {
+	name   int
+	branch int
+	age    int
+	flags  int
+}
+
+const (
+	maxNameCol   = 44
+	maxBranchCol = 34
+)
+
+// worktreeColWidths measures the worktrees to size each column, capping the
+// name and branch columns so very long names don't blow out the layout.
+func (m model) worktreeColWidths() colWidths {
+	c := colWidths{
+		name:   lipgloss.Width("NAME"),
+		branch: lipgloss.Width("BRANCH"),
+		age:    lipgloss.Width("AGE"),
 	}
-	
-	content := fmt.Sprintf("%s (%s)", filepath.Base(displayPath), worktree.Branch)
-	
-	// Check if this worktree is being deleted
-	if m.deletingWorktree && worktree.Path == m.deletingPath {
+	for _, wt := range m.worktrees {
+		c.name = max(c.name, lipgloss.Width(filepath.Base(wt.Path)))
+		c.branch = max(c.branch, lipgloss.Width(wt.Branch))
+		c.age = max(c.age, lipgloss.Width(relativeTime(wt.LastCommit)))
+		c.flags = max(c.flags, lipgloss.Width(worktreeFlagsPlain(wt)))
+	}
+	c.name = min(c.name, maxNameCol)
+	c.branch = min(c.branch, maxBranchCol)
+	return c
+}
+
+// renderWorktreeHeader is the dim column-header row above the worktree table.
+func (m model) renderWorktreeHeader(c colWidths) string {
+	cells := []string{
+		padRight("NAME", c.name),
+		padRight("BRANCH", c.branch),
+		padRight("AGE", c.age),
+		padRight("", c.flags),
+		"PR",
+	}
+	return tableHeaderStyle.Render("   " + strings.Join(cells, "  "))
+}
+
+func (m model) renderWorktreeItem(worktree Worktree, selected bool, c colWidths) string {
+	if m.deleting[worktree.Path] {
 		deletingStyle := errorStyle.Copy().Strikethrough(true)
-		return deletingStyle.Render("🗑️  Deleting " + content + "...")
+		marker := "   "
+		if selected {
+			marker = " ▶ "
+		}
+		return deletingStyle.Render(marker + "🗑️  " + filepath.Base(worktree.Path) + " (deleting…)")
 	}
-	
 	if selected {
-		return selectedItemStyle.Render("▶ " + content)
+		// White-on-purple across the whole row; cells are rendered plain so the
+		// highlight background isn't broken by per-cell color resets.
+		return tableSelectedStyle.Render(" ▶ " + m.worktreeRow(worktree, c, false))
 	}
-	return normalItemStyle.Render("  " + content)
+	return "   " + m.worktreeRow(worktree, c, true)
+}
+
+// worktreeRow lays a worktree's cells into fixed-width columns. When colorize is
+// false (the selected row) cells are plain text so the row's background
+// highlight survives.
+func (m model) worktreeRow(wt Worktree, c colWidths, colorize bool) string {
+	name := padRight(truncateStr(filepath.Base(wt.Path), c.name), c.name)
+	branch := padRight(truncateStr(wt.Branch, c.branch), c.branch)
+	age := padRight(relativeTime(wt.LastCommit), c.age)
+
+	if !colorize {
+		flags := padRight(worktreeFlagsPlain(wt), c.flags)
+		return strings.Join([]string{name, branch, age, flags, m.prCell(wt, false)}, "  ")
+	}
+
+	flags := worktreeFlagsColored(wt) + strings.Repeat(" ", max(0, c.flags-lipgloss.Width(worktreeFlagsPlain(wt))))
+	cells := []string{
+		name,
+		tableBranchStyle.Render(branch),
+		metaAgeStyle.Render(age),
+		flags,
+		m.prCell(wt, true),
+	}
+	return strings.Join(cells, "  ")
+}
+
+// worktreeFlagsPlain / worktreeFlagsColored render the local-change markers:
+// '*' for uncommitted changes and '↑N' for unpushed commits.
+func worktreeFlagsPlain(wt Worktree) string {
+	var parts []string
+	if wt.Dirty {
+		parts = append(parts, "*")
+	}
+	if wt.Ahead > 0 {
+		parts = append(parts, fmt.Sprintf("↑%d", wt.Ahead))
+	}
+	return strings.Join(parts, " ")
+}
+
+func worktreeFlagsColored(wt Worktree) string {
+	var parts []string
+	if wt.Dirty {
+		parts = append(parts, metaDirtyStyle.Render("*"))
+	}
+	if wt.Ahead > 0 {
+		parts = append(parts, metaAheadStyle.Render(fmt.Sprintf("↑%d", wt.Ahead)))
+	}
+	return strings.Join(parts, " ")
+}
+
+// prCell renders the PR column. colorize=false yields plain text for the
+// highlighted (selected) row.
+func (m model) prCell(wt Worktree, colorize bool) string {
+	if st, ok := m.prStatuses[wt.Branch]; ok {
+		if st == nil {
+			return ""
+		}
+		if colorize {
+			return renderPRBadge(st)
+		}
+		return prBadgePlain(st)
+	}
+	if m.prLoading && wt.Branch != "" {
+		if colorize {
+			return metaDimStyle.Render("PR …")
+		}
+		return "PR …"
+	}
+	return ""
+}
+
+// startNextDelete pops the delete queue and returns a command to delete the
+// next worktree, marking a deletion as active. Returns nil (and clears the
+// active flag) when the queue is empty.
+func (m *model) startNextDelete() tea.Cmd {
+	if len(m.deleteQueue) == 0 {
+		m.deleteActive = false
+		return nil
+	}
+	next := m.deleteQueue[0]
+	m.deleteQueue = m.deleteQueue[1:]
+	m.deleteActive = true
+	return processDeleteCmd(next)
+}
+
+// removeWorktreeByPath drops a worktree from the visible list (after it's been
+// deleted) and keeps the cursor in range.
+func (m *model) removeWorktreeByPath(path string) {
+	out := m.worktrees[:0]
+	for _, wt := range m.worktrees {
+		if wt.Path != path {
+			out = append(out, wt)
+		}
+	}
+	m.worktrees = out
+	if m.cursor >= len(m.worktrees) {
+		m.cursor = max(0, len(m.worktrees)-1)
+	}
+	m.adjustScrollOffset()
+}
+
+// mergeEnriched copies freshly computed local git metadata onto the current
+// worktrees, matching by path. Matching by path (rather than replacing the
+// slice) keeps things correct if the list changed while enrichment was in
+// flight: only entries that still exist get updated.
+func (m *model) mergeEnriched(enriched []Worktree) {
+	byPath := make(map[string]Worktree, len(enriched))
+	for _, e := range enriched {
+		byPath[e.Path] = e
+	}
+	for i := range m.worktrees {
+		if e, ok := byPath[m.worktrees[i].Path]; ok {
+			m.worktrees[i].LastCommit = e.LastCommit
+			m.worktrees[i].Dirty = e.Dirty
+			m.worktrees[i].Ahead = e.Ahead
+		}
+	}
+}
+
+func renderPRBadge(st *PRStatus) string {
+	label := fmt.Sprintf("PR #%d", st.Number)
+	switch st.State {
+	case "MERGED":
+		return prMergedStyle.Render("✓ " + label + " merged")
+	case "CLOSED":
+		return prClosedStyle.Render("✗ " + label + " closed")
+	default: // OPEN (or anything unexpected)
+		return prOpenStyle.Render("● " + label + " open")
+	}
+}
+
+func prBadgePlain(st *PRStatus) string {
+	label := fmt.Sprintf("PR #%d", st.Number)
+	switch st.State {
+	case "MERGED":
+		return "✓ " + label + " merged"
+	case "CLOSED":
+		return "✗ " + label + " closed"
+	default:
+		return "● " + label + " open"
+	}
+}
+
+// truncateStr shortens s to width display columns, adding an ellipsis.
+func truncateStr(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= width {
+		return s
+	}
+	if width == 1 {
+		return "…"
+	}
+	return string(r[:width-1]) + "…"
+}
+
+// padRight right-pads s with spaces to width display columns.
+func padRight(s string, width int) string {
+	if gap := width - lipgloss.Width(s); gap > 0 {
+		return s + strings.Repeat(" ", gap)
+	}
+	return s
 }
 
 func (m model) renderBranchItem(branch Branch, selected bool) string {
@@ -737,9 +1031,15 @@ func runNonInteractive(listWorktrees, listBranches *bool, createWorktreeFlag, de
 			fmt.Printf("Error getting worktrees: %v\n", err)
 			os.Exit(1)
 		}
+		enrichWorktreesLocal(worktrees)
+		prs := fetchPRStatuses(worktrees)
 		fmt.Println("Worktrees:")
 		for _, wt := range worktrees {
-			fmt.Printf("  %s (%s)\n", wt.Path, wt.Branch)
+			if meta := plainWorktreeMeta(wt, prs); meta != "" {
+				fmt.Printf("  %s (%s)  [%s]\n", wt.Path, wt.Branch, meta)
+			} else {
+				fmt.Printf("  %s (%s)\n", wt.Path, wt.Branch)
+			}
 		}
 	}
 
